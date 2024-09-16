@@ -38,15 +38,75 @@ class PayloadType(utils.Enum):
     guild_sync = 12
 
 
+class Status:
+    def __init__(self, shard_id: int):
+        self.shard_id = shard_id
+
+        self.sequence: Optional[int] = None
+        self.session_id: Optional[str] = None
+        self.gateway = DEFAULT_GATEWAY
+        self.is_alive = False
+
+        self.latency: float = float("inf")
+        self._last_ack: float = time.perf_counter()
+        self._last_send: float = time.perf_counter()
+        self._last_recv: float = time.perf_counter()
+        self._last_heartbeat: Optional[float] = None
+
+    @property
+    def ping(self) -> float:
+        return self._last_recv - self._last_send
+
+    def reset(self) -> None:
+        self.sequence = None
+        self.session_id = None
+        self.gateway = DEFAULT_GATEWAY
+        self.is_alive = False
+
+    def can_resume(self) -> bool:
+        return self.session_id is not None
+
+    def update_sequence(self, sequence: int) -> None:
+        self.sequence = sequence
+        self.is_alive = True
+
+    def update_ready_data(self, data: dict) -> None:
+        self.session_id = data["session_id"]
+        self.gateway = yarl.URL(data["resume_gateway_url"])
+        self.is_alive = True
+
+    def get_payload(self) -> dict:
+        return {
+            "op": int(PayloadType.heartbeat),
+            "d": self.sequence
+        }
+
+    def update_send(self) -> None:
+        self._last_send = time.perf_counter()
+
+    def update_heartbeat(self) -> None:
+        self._last_heartbeat = time.perf_counter()
+
+    def tick(self) -> None:
+        self._last_recv = time.perf_counter()
+
+    def ack(self) -> None:
+        ack_time = time.perf_counter()
+        self._last_ack = ack_time
+        self.latency = ack_time - self._last_send
+        if self.latency > 10:
+            _log.warning(f"Shard {self.shard_id} latency is {self.latency:.2f}s behind")
+
+
 class WebSocket:
     def __init__(
         self,
         bot: Client,
         intents: Intents,
+        shard_id: int,
         *,
-        gateway: Optional[yarl.URL] = None,
-        shard_id: Optional[int] = None,
         shard_count: Optional[int] = None,
+        raw_events: bool = False,
         api_version: Optional[int] = 8
     ):
         self.bot = bot
@@ -57,22 +117,20 @@ class WebSocket:
         self.api_version = api_version
         self.shard_id = shard_id
         self.shard_count = shard_count
+        self.raw_events = raw_events
 
         self.ws: Optional[ws.WebSocketClientProtocol] = None
+
         self.parser = Parser(bot)
+        self.status = Status(shard_id)
 
         self._connection = None
 
         self._buffer: bytearray = bytearray()
         self._zlib: zlib._Decompress = zlib.decompressobj()
 
-        self._sequence: Optional[str] = None
-        self._session_id: Optional[str] = None
         self._heartbeat_interval: float = 41_250 / 1000  # 41.25 seconds
-        self._last_ping: Optional[int] = None
         self._close_code: Optional[int] = None
-
-        self.gateway = gateway or DEFAULT_GATEWAY
 
     @property
     def url(self) -> str:
@@ -80,22 +138,28 @@ class WebSocket:
         if not isinstance(self.api_version, int):
             raise TypeError("api_version must be of type int")
 
-        return self.gateway.with_query(
+        return self.status.gateway.with_query(
             v=self.api_version,
             encoding="json",
             compress="zlib-stream"
         ).human_repr()
 
     def _reset_buffer(self) -> None:
+        self.status.is_alive = False
         self._buffer = bytearray()
         self._zlib = zlib.decompressobj()
 
     def _reset_instance(self) -> None:
         self._reset_buffer()
+        self.status.reset()
 
-        self._sequence = None
-        self._session_id = None
-        self.gateway = DEFAULT_GATEWAY
+    def _can_handle_close(self) -> bool:
+        code = self._close_code or self.ws.close_code
+        return code not in (1000, 4004, 4010, 4011, 4012, 4013, 4014)
+
+    def _was_normal_close(self) -> bool:
+        code = self._close_code or self.ws.close_code
+        return code == 1000
 
     async def send_message(self, message: Union[dict, PayloadType]) -> None:
         """ Sends a message to the websocket """
@@ -107,18 +171,15 @@ class WebSocket:
 
         _log.debug(f"Sending message: {message}")
         await self.ws.send(json.dumps(message))
+        self.status.update_send()
 
     async def close(self, code: Optional[int] = 1000) -> None:
-        """ Closes the websocket """
+        """ Closes the websocket for good, or forcefully """
         self._reset_instance()
 
         code = code or 1000
         self._close_code = code
         await self.ws.close(code=code)
-
-    def _can_handle_close(self) -> bool:
-        code = self._close_code or self.ws.close_code
-        return code not in (1000, 4004, 4010, 4011, 4012, 4013, 4014)
 
     async def reconnect(self) -> None:
         """ Reconnects the websocket """
@@ -148,9 +209,9 @@ class WebSocket:
         seq = msg.get("s", None)
 
         if seq is not None:
-            self._sequence = seq
+            self.status.update_sequence(seq)
 
-        self._last_ping = int(time.time())
+        self.status.tick()
 
         if op != PayloadType.dispatch:
             match op:
@@ -159,10 +220,12 @@ class WebSocket:
                     return
 
                 case PayloadType.heartbeat_ack:
-                    _log.debug(f"Shard {self.shard_id} heartbeat ack")
+                    self.status.ack()
+                    _log.debug(f"Shard {self.shard_id} heartbeat ACK")
                     return
 
                 case PayloadType.heartbeat:
+                    _log.debug(f"Shard {self.shard_id} heartbeat from event-case")
                     await self.send_message(PayloadType.heartbeat)
                     return
 
@@ -171,7 +234,7 @@ class WebSocket:
                         int(data["heartbeat_interval"]) / 1000
                     )
 
-                    if self._session_id:
+                    if self.status.can_resume():
                         _log.debug(f"Shard {self.shard_id} resuming session")
                         await self.send_message(PayloadType.resume)
                     else:
@@ -185,20 +248,24 @@ class WebSocket:
                         await self.close()
                         raise Exception("Session invalidated")
 
+                    elif data is False:
+                        self._reset_instance()
+                        _log.warning(f"Shard {self.shard_id} session invalidated, attempting reboot")
+                        await self.reconnect()
+
                 case _:
                     return
 
         match event:
             case "READY":
-                self._sequence = msg["s"]
-                self._session_id = data["session_id"]
-                self.gateway = yarl.URL(data["resume_gateway_url"])
+                self.status.update_sequence(msg["s"])
+                self.status.update_ready_data(data)  # type: ignore
+                _log.info(f"Shard {self.shard_id} ready")
 
             case "RESUMED":
-                _log.debug(f"Shard {self.shard_id}/{self.shard_count} resumed")
+                _log.info(f"Shard {self.shard_id} resumed")
 
             case _:
-                # _log.debug(f"Unknown event: {event}")
                 pass
 
     async def _socket_manager(self) -> None:
@@ -207,13 +274,15 @@ class WebSocket:
 
             async with ws.connect(self.url) as socket:
                 self.ws = socket
+                self.status.is_alive = True
 
                 try:
                     while keep_waiting:
                         if (
-                            not self._last_ping or
-                            int(time.time()) - self._last_ping > self._heartbeat_interval
+                            not self.status._last_heartbeat or
+                            time.perf_counter() - self.status._last_heartbeat > self._heartbeat_interval
                         ):
+                            _log.debug(f"Shard {self.shard_id} heartbeat from if-case")
                             await self.send_message(PayloadType.heartbeat)
 
                         try:
@@ -224,6 +293,7 @@ class WebSocket:
 
                         except asyncio.TimeoutError:
                             # No event received, send in case..
+                            _log.debug(f"Shard {self.shard_id} heartbeat from except-case")
                             await self.send_message(PayloadType.heartbeat)
 
                         except asyncio.CancelledError:
@@ -234,25 +304,28 @@ class WebSocket:
 
                 except Exception as e:
                     keep_waiting = False
-                    self._reset_buffer()
 
                     if self._can_handle_close():
-                        print(utils.traceback_maker(e))
-                        _log.debug(f"Shard {self.shard_id}/{self.shard_count} closed, attempting reconnect")
-                        await self.reconnect()
+                        self._reset_buffer()
+
+                        _log.warning(f"Shard {self.shard_id} closed, attempting reconnect")
+                        _log.debug(utils.traceback_maker(e))
 
                     else:  # Something went wrong, reset the instance
                         self._reset_instance()
-                        _log.error(
-                            f"Shard {self.shard_id}/{self.shard_count} crashed",
-                            exc_info=e
-                        )
+
+                        if self._was_normal_close():
+                            # Possibly Discord closed the connection due to load balancing
+                            _log.warning(f"Shard {self.shard_id} closed, attempting new connection")
+                        else:
+                            _log.error(f"Shard {self.shard_id} crashed", exc_info=e)
+
+                    # Will automatically do new connection or attempt resume
+                    await self.reconnect()
 
         except Exception as e:
-            _log.error(
-                f"Shard {self.shard_id}/{self.shard_count} crashed completly",
-                exc_info=e
-            )
+            self._reset_instance()
+            _log.error(f"Shard {self.shard_id} crashed completly", exc_info=e)
 
     async def on_event(self, name: str, event: Any) -> None:
         new_name = name.lower()
@@ -260,6 +333,10 @@ class WebSocket:
 
         if not data:
             return None
+
+        if self.raw_events:
+            self.bot.dispatch("raw_socket_received", event)
+            return
 
         match name:
             case "MESSAGE_CREATE" | "MESSAGE_UPDATE":
@@ -285,17 +362,13 @@ class WebSocket:
             raise TypeError("op must be of type PayloadType")
 
         match op:
-
             case PayloadType.heartbeat:
-                self._last_ping = int(time.time())
-                return {
-                    "op": op.value,
-                    "d": self._heartbeat_interval
-                }
+                self.status.update_heartbeat()
+                return self.status.get_payload()
 
             case PayloadType.hello:
                 return {
-                    "op": op.value,
+                    "op": int(op),
                     "d": {
                         "heartbeat_interval": int(self._heartbeat_interval * 1000)
                     }
@@ -303,17 +376,17 @@ class WebSocket:
 
             case PayloadType.resume:
                 return {
-                    "op": op.value,
+                    "op": int(op),
                     "d": {
-                        "seq": self._sequence,
-                        "session_id": self._session_id,
+                        "seq": self.status.sequence,
+                        "session_id": self.status.sequence,
                         "token": self.token,
                     }
                 }
 
             case _:
                 payload = {
-                    "op": op.value,
+                    "op": int(op),
                     "d": {
                         "token": self.token,
                         "intents": self.intents.value,
@@ -327,7 +400,7 @@ class WebSocket:
                     }
                 }
 
-                if self.shard_id is not None and self.shard_count is not None:
+                if self.shard_count is not None:
                     payload["d"]["shard"] = [self.shard_id, self.shard_count]
 
                 return payload

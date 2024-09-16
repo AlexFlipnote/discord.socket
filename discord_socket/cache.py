@@ -3,6 +3,7 @@ from discord_http import PartialGuild
 
 # TODO
 # - Add an optional cache for multiple data types
+# - Be able to dynamically update the cache
 
 __all__ = (
     "Cache",

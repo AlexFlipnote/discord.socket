@@ -1,7 +1,6 @@
 
 import logging
 import asyncio
-import yarl
 
 from typing import Optional, Coroutine
 from discord_http import Client
@@ -35,53 +34,64 @@ class SocketClient:
 
         self.__shards: dict[int, WebSocket] = {}
 
+        self.bot.backend.add_url_rule(
+            "/shards",
+            "shards",
+            self._index_websocket_status,  # type: ignore
+            methods=["GET"]
+        )
+
     def get_shard(self, shard_id: int) -> Optional[WebSocket]:
         return self.__shards.get(shard_id, None)
 
-    async def _fetch_gateway(self) -> tuple[int, int, yarl.URL]:
+    async def _index_websocket_status(self) -> dict[int, dict]:
+        return {
+            shard_id: {
+                "ping": shard.status.ping,
+                "latency": shard.status.latency,
+                "is_alive": shard.status.is_alive
+            }
+            for shard_id, shard in sorted(
+                self.__shards.items(), key=lambda x: x[0]
+            )
+        }
+
+    async def _fetch_gateway(self) -> tuple[int, int]:
         r = await self.bot.state.query("GET", "/gateway/bot")
 
         return (
             r.response["shards"],
-            r.response["session_start_limit"]["max_concurrency"],
-            yarl.URL(r.response["url"])
+            r.response["session_start_limit"]["max_concurrency"]
         )
 
-    async def _launch_shard(self, gateway: yarl.URL, shard_id: int) -> None:
+    async def _launch_shard(self, shard_id: int) -> None:
         try:
             shard = WebSocket(
                 bot=self.bot,
                 intents=self.intents,
-                gateway=gateway,
                 shard_id=shard_id,
                 shard_count=self.shard_count,
                 api_version=self.api_version
             )
             shard.connect()
-            while not shard._session_id:
+            while not shard.status.session_id:
                 await asyncio.sleep(0.5)
 
         except Exception as e:
             _log.error("Error launching shard, trying again...", exc_info=e)
-            return await self._launch_shard(gateway, shard_id)
+            return await self._launch_shard(shard_id)
 
         self.__shards[shard_id] = shard
 
     async def launch_shards(self) -> None:
         if self.shard_count is None:
-            (
-                self.shard_count,
-                self.max_concurrency,
-                gateway
-            ) = await self._fetch_gateway()
-        else:
-            gateway = yarl.URL("wss://gateway.discord.gg/")
+            self.shard_count, self.max_concurrency = await self._fetch_gateway()
 
         shard_ids = self.shard_ids or range(self.shard_count)
 
         if not self.max_concurrency:
             for shard_id in shard_ids:
-                await self._launch_shard(gateway, shard_id)
+                await self._launch_shard(shard_id)
 
         else:
             chunks = [
@@ -91,14 +101,18 @@ class SocketClient:
 
             for i, shard_chunk in enumerate(chunks, start=1):
                 _booting: list[Coroutine] = [
-                    self._launch_shard(gateway, shard_id)
+                    self._launch_shard(shard_id)
                     for shard_id in shard_chunk
                 ]
 
                 _log.debug(f"Launching bucket {i}/{len(chunks)}")
                 await asyncio.gather(*_booting)
-                _log.debug(f"Bucket {i}/{len(chunks)} shards launched, waiting (5s/bucket)")
-                await asyncio.sleep(5)
+
+                if i != len(chunks):
+                    _log.debug(f"Bucket {i}/{len(chunks)} shards launched, waiting (5s/bucket)")
+                    await asyncio.sleep(5)
+                else:
+                    _log.debug(f"Bucket {i}/{len(chunks)} shards launched, last bucket, skipping wait")
 
         _log.debug("All buckets/shards launched")
 

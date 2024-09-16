@@ -2,7 +2,7 @@ import json
 import logging
 
 from discord_http import Client, Message, PartialMessage
-from discord_socket import WebSocket, Intents
+from discord_socket import SocketClient, Intents
 
 with open("./config.json", "r") as f:
     config = json.load(f)
@@ -15,13 +15,12 @@ client = Client(
     logging_level=logging.DEBUG
 )
 
-socket = WebSocket(
+socket = SocketClient(
     bot=client,
     intents=Intents.from_names(
         "guilds",
         "guild_messages",
         "guild_message_reactions",
-        "message_content",
         "guild_bans",
         "guild_emojis_and_stickers",
         "direct_messages",
@@ -54,5 +53,5 @@ async def on_message_reaction_remove(data: dict):
     print(data)
 
 
-socket.connect()
-client.start()
+socket.start()
+client.start(host=config["host"], port=config["port"])

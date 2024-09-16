@@ -1,6 +1,8 @@
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # flake8: noqa: F401
+from .cache import *
+from .client import *
 from .intents import *
-from .websocket import *
 from .parser import *
+from .websocket import *

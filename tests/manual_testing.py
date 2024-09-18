@@ -12,7 +12,7 @@ client = Client(
     token=config["token"],
     application_id=config["application_id"],
     public_key=config["public_key"],
-    logging_level=logging.DEBUG
+    # logging_level=logging.DEBUG
 )
 
 socket = SocketClient(
@@ -28,12 +28,18 @@ socket = SocketClient(
 )
 
 
-"""@client.listener()
-async def on_message_create(msg: Message):
-    print((msg, repr(msg)))
-
-
 @client.listener()
+async def on_message_create(msg: Message, shard_id: int):
+    # This is some very scuffed testing, but for 190k servers, whatever...
+    if msg.author.id != 86477779717066752:
+        return
+
+    print(f"Detected {msg.author} in shard {shard_id}")
+    if msg.content.startswith("!ping"):
+        await msg.reply(f"Pong in shard {shard_id}")
+
+
+"""@client.listener()
 async def on_message_update(msg: Message):
     print((msg, repr(msg)))
 

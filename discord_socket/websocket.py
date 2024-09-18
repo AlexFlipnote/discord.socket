@@ -7,6 +7,7 @@ import time
 import yarl
 import websockets as ws
 
+from datetime import datetime, UTC
 from typing import Optional, Union, Any
 from discord_http import Client, utils
 
@@ -45,7 +46,6 @@ class Status:
         self.sequence: Optional[int] = None
         self.session_id: Optional[str] = None
         self.gateway = DEFAULT_GATEWAY
-        self.is_alive = False
 
         self.latency: float = float("inf")
         self._last_ack: float = time.perf_counter()
@@ -61,19 +61,16 @@ class Status:
         self.sequence = None
         self.session_id = None
         self.gateway = DEFAULT_GATEWAY
-        self.is_alive = False
 
     def can_resume(self) -> bool:
         return self.session_id is not None
 
     def update_sequence(self, sequence: int) -> None:
         self.sequence = sequence
-        self.is_alive = True
 
     def update_ready_data(self, data: dict) -> None:
         self.session_id = data["session_id"]
         self.gateway = yarl.URL(data["resume_gateway_url"])
-        self.is_alive = True
 
     def get_payload(self) -> dict:
         return {
@@ -111,7 +108,6 @@ class WebSocket:
     ):
         self.bot = bot
 
-        self.token = bot.token
         self.intents = intents
 
         self.api_version = api_version
@@ -131,6 +127,7 @@ class WebSocket:
 
         self._heartbeat_interval: float = 41_250 / 1000  # 41.25 seconds
         self._close_code: Optional[int] = None
+        self._last_activity: datetime = datetime.now(UTC)
 
     @property
     def url(self) -> str:
@@ -145,7 +142,6 @@ class WebSocket:
         ).human_repr()
 
     def _reset_buffer(self) -> None:
-        self.status.is_alive = False
         self._buffer = bytearray()
         self._zlib = zlib.decompressobj()
 
@@ -171,22 +167,19 @@ class WebSocket:
 
         _log.debug(f"Sending message: {message}")
         await self.ws.send(json.dumps(message))
+
+        self._last_activity = datetime.now(UTC)
         self.status.update_send()
 
     async def close(self, code: Optional[int] = 1000) -> None:
         """ Closes the websocket for good, or forcefully """
-        self._reset_instance()
-
         code = code or 1000
         self._close_code = code
         await self.ws.close(code=code)
 
-    async def reconnect(self) -> None:
-        """ Reconnects the websocket """
-        await self.ws.close()
-        self.connect()
-
     async def received_message(self, msg: Any) -> None:
+        self._last_activity = datetime.now(UTC)
+
         if type(msg) is bytes:
             self._buffer.extend(msg)
 
@@ -216,7 +209,8 @@ class WebSocket:
         if op != PayloadType.dispatch:
             match op:
                 case PayloadType.reconnect:
-                    await self.reconnect()
+                    _log.warning(f"Shard {self.shard_id} got requrested to reconnect")
+                    await self.close(code=1013)  # 1013 = Try again later
                     return
 
                 case PayloadType.heartbeat_ack:
@@ -244,14 +238,16 @@ class WebSocket:
                     return
 
                 case PayloadType.invalidate_session:
+                    self._reset_instance()
+
                     if data is True:
-                        await self.close()
-                        raise Exception("Session invalidated")
+                        _log.error(f"Shard {self.shard_id} session invalidated, not attempting reboot...")
+                        # TODO: Add a way to kill shard maybe?
 
                     elif data is False:
-                        self._reset_instance()
-                        _log.warning(f"Shard {self.shard_id} session invalidated, attempting reboot")
-                        await self.reconnect()
+                        _log.warning(f"Shard {self.shard_id} session invalidated, resetting instance")
+
+                    await self.close()
 
                 case _:
                     return
@@ -271,10 +267,10 @@ class WebSocket:
     async def _socket_manager(self) -> None:
         try:
             keep_waiting: bool = True
+            self._reset_buffer()
 
             async with ws.connect(self.url) as socket:
                 self.ws = socket
-                self.status.is_alive = True
 
                 try:
                     while keep_waiting:
@@ -307,21 +303,17 @@ class WebSocket:
 
                     if self._can_handle_close():
                         self._reset_buffer()
-
                         _log.warning(f"Shard {self.shard_id} closed, attempting reconnect")
-                        _log.debug(utils.traceback_maker(e))
 
                     else:  # Something went wrong, reset the instance
                         self._reset_instance()
-
                         if self._was_normal_close():
                             # Possibly Discord closed the connection due to load balancing
                             _log.warning(f"Shard {self.shard_id} closed, attempting new connection")
                         else:
                             _log.error(f"Shard {self.shard_id} crashed", exc_info=e)
 
-                    # Will automatically do new connection or attempt resume
-                    await self.reconnect()
+                    self.connect()
 
         except Exception as e:
             self._reset_instance()
@@ -341,7 +333,7 @@ class WebSocket:
         match name:
             case "MESSAGE_CREATE" | "MESSAGE_UPDATE":
                 event = self.parser.message_create(data)
-                self.bot.dispatch(new_name, event)
+                self.bot.dispatch(new_name, event, self.shard_id)
 
             case "MESSAGE_DELETE":
                 event = self.parser.message_delete(data)
@@ -379,8 +371,8 @@ class WebSocket:
                     "op": int(op),
                     "d": {
                         "seq": self.status.sequence,
-                        "session_id": self.status.sequence,
-                        "token": self.token,
+                        "session_id": self.status.session_id,
+                        "token": self.bot.token,
                     }
                 }
 
@@ -388,7 +380,7 @@ class WebSocket:
                 payload = {
                     "op": int(op),
                     "d": {
-                        "token": self.token,
+                        "token": self.bot.token,
                         "intents": self.intents.value,
                         "properties": {
                             "os": sys.platform,

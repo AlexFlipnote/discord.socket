@@ -2,6 +2,7 @@
 import logging
 import asyncio
 
+from datetime import datetime, UTC
 from typing import Optional, Coroutine
 from discord_http import Client
 
@@ -45,11 +46,15 @@ class SocketClient:
         return self.__shards.get(shard_id, None)
 
     async def _index_websocket_status(self) -> dict[int, dict]:
+        _now = datetime.now(UTC)
         return {
             shard_id: {
                 "ping": shard.status.ping,
                 "latency": shard.status.latency,
-                "is_alive": shard.status.is_alive
+                "activity": {
+                    "last": str(shard._last_activity),
+                    "between": str(_now - shard._last_activity)
+                }
             }
             for shard_id, shard in sorted(
                 self.__shards.items(), key=lambda x: x[0]
@@ -109,12 +114,12 @@ class SocketClient:
                 await asyncio.gather(*_booting)
 
                 if i != len(chunks):
-                    _log.debug(f"Bucket {i}/{len(chunks)} shards launched, waiting (5s/bucket)")
+                    _log.info(f"Bucket {i}/{len(chunks)} shards launched, waiting (5s/bucket)")
                     await asyncio.sleep(5)
                 else:
-                    _log.debug(f"Bucket {i}/{len(chunks)} shards launched, last bucket, skipping wait")
+                    _log.info(f"Bucket {i}/{len(chunks)} shards launched, last bucket, skipping wait")
 
-        _log.debug("All buckets/shards launched")
+        _log.info(f"All {len(chunks)} bucket(s) have launched a total of {self.shard_count} shard(s)")
 
     def start(self) -> None:
         self.bot.loop.create_task(self.launch_shards())

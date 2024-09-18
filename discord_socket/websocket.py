@@ -209,7 +209,7 @@ class WebSocket:
         if op != PayloadType.dispatch:
             match op:
                 case PayloadType.reconnect:
-                    _log.warning(f"Shard {self.shard_id} got requrested to reconnect")
+                    _log.debug(f"Shard {self.shard_id} got requrested to reconnect")
                     await self.close(code=1013)  # 1013 = Try again later
                     return
 
@@ -333,7 +333,7 @@ class WebSocket:
         match name:
             case "MESSAGE_CREATE" | "MESSAGE_UPDATE":
                 event = self.parser.message_create(data)
-                self.bot.dispatch(new_name, event, self.shard_id)
+                self.bot.dispatch(new_name, event)
 
             case "MESSAGE_DELETE":
                 event = self.parser.message_delete(data)
